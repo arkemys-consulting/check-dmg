@@ -17,7 +17,7 @@ if [[ ( -t 1 || -n "$FORCE_COLOR" ) && -z "$NO_COLOR" ]]; then
 else
   RED= YEL= GRN= BLU= CYA= MAG= DIM= BLD= ITA= NC= BG_RED= BG_YEL= BG_GRN=
 fi
-W=$(tput cols 2>/dev/null); [[ -z "$W" || "$W" -lt 60 ]] && W=80; (( W > 100 )) && W=100
+W=${CHECK_DMG_WIDTH:-$(tput cols 2>/dev/null)}; [[ -z "$W" || "$W" -lt 60 ]] && W=80; (( W > 100 )) && W=100
 
 # Clickable links in terminals that support them (OSC 8); plain URLs elsewhere.
 case "$TERM_PROGRAM" in iTerm.app|WezTerm|vscode|ghostty|Hyper|Tabby) LINKS=1 ;; *) LINKS=0 ;; esac

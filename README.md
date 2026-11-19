@@ -1,121 +1,181 @@
-# check-dmg
+<p align="center">
+  <img src="docs/logo.svg" width="96" height="96" alt="check-dmg icon">
+</p>
 
-**Look inside a macOS installer before you open it.**
+<h1 align="center">check-dmg</h1>
 
-`check-dmg` inspects a `.dmg`, `.iso`, `.pkg`, `.zip`, `.aar` or `.app` **without running anything inside it**, and tells you in plain words what it would do to your Mac: who signed it, what runs during installation, what runs as root, where files go, and whether anything in it looks like a data stealer.
+<p align="center"><strong>Know what a Mac installer will do before you open it.</strong></p>
 
-It was written after a real infection, and tested on the installer that caused it. That package wrapped the genuine, developer-signed installer of a well-known app. Once you typed your password, its post-install script disabled Gatekeeper, dropped a small app into `/Library/Application Support` and opened it. That app contained no readable text, only encrypted shell commands, and it dropped an infostealer into `/tmp`. Every sign was there, in files nobody reads. This tool reads them.
+<p align="center">
+  One command looks inside a downloaded <code>.dmg</code>, <code>.pkg</code>, <code>.zip</code> or app, without running anything, and tells you in plain words whether it hides a password stealer, a fake "fix" script or a program that runs as root.
+</p>
 
-```
-check-dmg ~/Downloads/Some App 2.1.dmg
-```
+<p align="center">
+  <a href="#get-started"><img src="https://img.shields.io/badge/Install_in_one_line-2b3037?style=for-the-badge&amp;logo=apple&amp;logoColor=80bcff" height="36" alt="Install in one line"></a>
+  &nbsp;
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2b3037?style=for-the-badge" height="36" alt="MIT license"></a>
+  &nbsp;
+  <img src="https://img.shields.io/badge/macOS_13+-2b3037?style=for-the-badge" height="36" alt="macOS 13 or later">
+</p>
 
-## Why
+<p align="center">
+  <a href="#what-it-catches">What it catches</a> · <a href="#get-started">Get started</a> · <a href="#stay-safe-in-30-seconds">Stay safe</a> · <a href="#how-it-works">How it works</a> · <a href="#limits">Limits</a>
+</p>
 
-On macOS, most infections do not come from exploits. They come from installers that people run themselves, mostly from outside the App Store:
+<p align="center">
+  <a href="docs/screenshots/dropper.png"><img src="docs/screenshots/dropper.png" width="860" alt="check-dmg finding a package that disables Gatekeeper, hides an app in /Library/Application Support, launches it after installation, and whose program hides the commands it runs. Verdict: DO NOT RUN"></a>
+</p>
 
-- **Infostealers** (AMOS, Banshee, Poseidon and others) hidden in installers or "fix" scripts. They show a fake password prompt, then copy the keychain, browser passwords and cookies, crypto wallets and documents. Stolen cookies open your accounts without a password or a 2FA code.
-- **ClickFix** pages that ask you to paste a command into Terminal. No Gatekeeper check ever runs on that command.
-- **Install scripts** that ask for your password and disable Gatekeeper for the whole system, when one app only needed unlocking.
+## Your password is the key
 
-Gatekeeper does not look at most of this, and it does not look at all at files copied by SFTP or synced from a server, or extracted by some tools. `check-dmg` is a second pair of eyes for exactly those cases.
+Most Macs are not infected by clever exploits. They are infected by an installer that someone opened and gave their password to.
 
-## What it checks
+That is exactly how the installer behind this tool worked. It looked like a well-known photo app, and it even carried the real, developer-signed installer to look legitimate. Once the password was typed, it quietly turned off Gatekeeper, hid a small app in a system folder, opened it, and that app dropped a **password stealer**. Stealers like this copy your saved passwords, your browser sessions (which open your accounts without a password or a 2FA code), your crypto wallets and your documents, in seconds.
 
-**The file**
-- Size, SHA-256, download source recorded by macOS, quarantine flag.
-- Disk images are mounted **read-only**, without being shown in the Finder, and ejected afterwards. An image you already opened is checked where it is.
-- Images inside folders inside images (a common layout) are opened too. `.zip` and Apple Archive (`.aar`) files are extracted to a temporary folder.
+Every sign was there, in files nobody reads. **check-dmg reads them for you.**
 
-**Each app**
-- Signature: developer, Apple, ad hoc, unknown certificate or none; whether it is intact; whether Gatekeeper accepts it (notarization).
-- Extra libraries injected at launch, helpers that will run as root at every startup, loose programs hidden in its resources.
-- Apps that are really scripts in disguise: AppleScript applets (the script is decompiled and read), Platypus wrappers, shell scripts as the app's program.
-- Entitlements that let outside code in (`disable-library-validation`, `allow-dyld-environment-variables`, `get-task-allow`).
-- **Programs that hide what they run**: a program that calls `system()`, `popen()`, `exec*()` or `posix_spawn()` but contains almost no readable text is encrypting its commands. Placeholder identifiers such as `com.example.*` are flagged too.
-- **Data stealer traces** in every compiled program: keychain dumping, browser credential files, crypto wallets, fake password prompts, data exfiltration, notes, command-and-control strings, virtual machine checks. One family alone is common in normal apps; three or more together is a red flag.
-- Comparison with the copy already installed in `/Applications`: same program, a different build, or a modified repack. It handles copies slimmed by cleaner apps (Intel code removed). If your installed copy is the developer's original, it tells you to keep it.
+## What it catches
 
-**Each installer package (`.pkg`)**
-- Signature.
-- Every script and every compiled program it runs as root, extracted without unpacking the payload (a 3 GB package is checked in about 20 seconds). Compiled programs cannot be read, so they are listed with their signer, the web addresses they contain and a VirusTotal link.
-- Where it writes, and whether it installs anything that starts automatically (`LaunchDaemons`, `LaunchAgents`, privileged helpers) or writes to unusual places.
-- **Apps installed outside Applications** and **installers inside the installer**: only those items are extracted from the payload, then checked like any other app or package. This is how droppers hide.
-- **Install scripts that open what they just installed** in a hidden or temporary folder.
-- Scripts of packages signed by their developer still get warnings for risky commands, but not red flags.
+- **Password and data stealers.** Programs that reach for your keychain, browser passwords and cookies, crypto wallets or notes, or that show fake password prompts.
+- **Programs that hide what they do.** A program that runs system commands but contains almost no readable text is hiding its commands. That is a dropper's signature.
+- **Hidden apps.** Installers that put an app somewhere you would never look, like `/Library/Application Support`, then open it right after installation.
+- **"Fix" and "patch" scripts.** Scripts that ask for your password and turn off Gatekeeper for the whole Mac, when only one app needed unlocking. You get the safe way to install instead.
+- **Copy-paste traps.** Command files and Terminal files that download and run code the moment you open them, the trick behind "paste this in Terminal" pages.
+- **Disguised and modified apps.** Apps that are really scripts, apps with extra code injected, unknown signers, and copies that differ from the one you already have.
+- **Instructions that weaken your Mac.** Readme files that tell you to disable Gatekeeper or System Integrity Protection.
 
-**Everything else in the image**
-- Scripts and `.command` files, scanned for risky commands (`curl | sh`, base64 decoding, `osascript` password prompts, `spctl --master-disable`, `launchctl`, keychain access, `sudo`). Harmless helpers that only remove the quarantine flag get a warning, not a red flag.
-- `.terminal` files that run a command when opened, web and file shortcuts (including ones with invisible names), hidden files and small hidden notes.
-- Readme and instruction files (`.txt`, `.html`, `.rtf`, `.nfo`): commands they ask you to type, and a warning if they ask you to weaken Gatekeeper or SIP.
+Every fingerprint is listed with a **VirusTotal** link, and with a free API key you see the number of detections right in your terminal. Your files are never uploaded.
 
-**VirusTotal**
-- Every fingerprint worth looking up is listed in one table, with a link.
-- With a free API key, the number of detections and the threat label are shown in the table, and a file detected by 5 engines or more becomes a red flag. **Only SHA-256 fingerprints are sent, never your files.**
+<p align="center">
+  <a href="docs/screenshots/stealer.png"><img src="docs/screenshots/stealer.png" width="420" alt="check-dmg finding a hidden program with the traces of a data stealer next to an app"></a>
+  &nbsp;
+  <a href="docs/screenshots/fix-script.png"><img src="docs/screenshots/fix-script.png" width="420" alt="check-dmg telling you not to run a fix script that disables Gatekeeper, and how to install the app safely without it"></a>
+</p>
 
-## Verdicts
+## Get started
 
-| Verdict | Meaning |
-|---|---|
-| **DO NOT RUN** | At least one red flag. Do not open it and never type your password for it. |
-| **DO NOT RUN THE SCRIPT** | The red flags all come from a script next to the app. The app itself looks fine: drag it to Applications and unlock that app only, as shown. |
-| **CAUTION** | Warnings only. Read them and check the VirusTotal links. |
-| **LOOKS CLEAN** | Nothing found. Still check the VirusTotal links. |
+You need a Mac with macOS 13 or later. Nothing else to install: check-dmg only uses tools that ship with macOS.
 
-The exit code is `1` when there is a red flag, `0` otherwise, so the tool can be used in scripts.
-
-## Install
-
-Requires macOS 13 or later. Nothing else: it uses the tools that ship with macOS.
-
-```bash
+```sh
 mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/arkemys-consulting/check-dmg/main/check-dmg -o ~/.local/bin/check-dmg
 chmod +x ~/.local/bin/check-dmg
 ```
 
-Make sure `~/.local/bin` is in your `PATH`. Yes, this README asks you to run a downloaded script: read it first, it is one file.
+Then, before you open anything you downloaded:
 
-### VirusTotal key (optional)
-
-Create a free account on virustotal.com, copy your API key from your profile, then:
-
-```bash
-mkdir -p ~/.config/check-dmg && umask 077 && pbpaste > ~/.config/check-dmg/vt-api-key
+```sh
+check-dmg ~/Downloads/Some\ App.dmg
 ```
 
-Or set `VT_API_KEY` in your environment. The free key allows 4 lookups per minute: the tool waits between batches. Use `--no-vt` to skip the lookups.
+Yes, this asks you to run a downloaded script. It is a single readable file: [read it first](check-dmg). If `check-dmg` is not found, add `~/.local/bin` to your `PATH`.
 
-## Usage
+### Reading the verdict
 
+| Verdict | What to do |
+|---|---|
+| **DO NOT RUN** | Delete it. Never type your password for it. |
+| **DO NOT RUN THE SCRIPT** | Only the script next to the app is dangerous. Drag the app to Applications and use the one-line unlock shown, no password needed. |
+| **CAUTION** | Nothing alarming, but read the warnings and open the VirusTotal links. |
+| **LOOKS CLEAN** | No known trap found. Still check the VirusTotal links. |
+
+## Stay safe in 30 seconds
+
+- **A drag-and-drop app never needs your password.** If something asks for it right after you open a new app, say no.
+- **Never paste a command from a web page into Terminal**, whatever the page says it fixes.
+- **Unlock one app, not your whole Mac:** `xattr -dr com.apple.quarantine "/Applications/Name.app"` instead of disabling Gatekeeper.
+- **Keep a firewall and a startup watcher running**, for example [LuLu](https://objective-see.org/products/lulu.html) and [BlockBlock](https://objective-see.org/products/blockblock.html) from Objective-See. They alert you when something new connects to the Internet or tries to start with your Mac.
+- **If you did give your password to something suspicious**, sign out of all sessions on your important accounts (email, password manager, banks, stores), then sign in again. That makes stolen browser cookies useless.
+
+---
+
+# For experts
+
+## How it works
+
+check-dmg is a single zsh script. It never executes anything from the file it inspects.
+
+**Containers**
+- Disk images (`.dmg`, `.iso`, `.sparseimage`) are attached read-only with `-nobrowse -noautoopen` and detached on exit. An image already mounted in the Finder is inspected in place.
+- Images inside folders inside images (two levels) are opened too, a layout some release groups use.
+- `.zip` files are extracted with `ditto`, Apple Archives (`.aar`, `.aea`) with `aa`, into a temporary folder that is deleted on exit.
+
+**Apps**
+- Signature from `codesign -dvv`: Developer ID or Apple, ad hoc, unknown certificate, unsigned; integrity with `codesign --verify --deep --strict`; notarization with `spctl -a -t exec`.
+- Placeholder bundle identifiers (`com.example.*`, `com.yourcompany.*`, missing).
+- Libraries loaded at launch that are not system libraries (`otool -L`), helpers in `Contents/Library/LaunchServices` and `LaunchDaemons` that will run as root, loose Mach-O files in `Resources`.
+- Disguised apps: AppleScript applets (`main.scpt` is decompiled with `osadecompile`; run-only scripts are reported as uninspectable), Platypus wrappers, and apps whose executable is a script.
+- Entitlements that accept outside code: `cs.disable-library-validation`, `cs.allow-dyld-environment-variables`, `get-task-allow`.
+- Comparison with the installed copy found by bundle identifier: version, signer, and SHA-256 of the main executable and every bundled dylib. Copies slimmed by cleaner apps are compared on their `arm64` slice (`lipo -thin`). An installed copy that is developer-signed and intact is reported as the original to keep.
+
+**Packages**
+- Signature with `pkgutil --check-signature`.
+- Only the `Scripts` archives are extracted (`xar` then `cpio`), never the payload, so a multi-gigabyte package is inspected in seconds. Shell scripts are scanned; Mach-O programs run by the installer are listed with their signer, the web addresses they contain and a VirusTotal fingerprint. Developer-signed programs are summarised per signer.
+- Payload file list with `pkgutil --payload-files`: destination summary, items that start automatically (`LaunchDaemons`, `LaunchAgents`, `PrivilegedHelperTools`, `StartupItems`), writes to `/tmp`, `/Users`, `/usr/local/bin`, `/etc`, hidden files outside app bundles.
+- Apps installed outside `/Applications` and installers inside the installer are extracted from the gzip payload by path (`cpio -id <patterns>`) and inspected recursively, two levels deep. pbzx payloads are listed but not opened.
+- Install scripts that open or load something they placed in `/Library/Application Support`, `/tmp`, `/Users/Shared` or a dot-folder are flagged.
+
+**Other files**
+- Scripts and `.command` files, `.terminal` files (their `CommandString` is extracted and scanned), `.webloc` (grouped by destination), `.inetloc` and `.fileloc`, small hidden notes, hidden files and folders.
+- Readmes (`.txt`, `.html`, `.rtf`, `.nfo`, `.md`): command lines are extracted (HTML is stripped of style and script blocks, RTF goes through `textutil`).
+
+## Detection rules
+
+| Rule | Red flag when | Warning when |
+|---|---|---|
+| Risky commands in a script | `curl`/`wget` piped to a shell, `base64 -d`, `osascript`, `hidden answer`, `launchctl load`, `LaunchAgents`/`LaunchDaemons`, `security find`/`dump`, `login.keychain`, `eval $(`, `sudo`, `spctl --master-disable`, `csrutil` | Only `/tmp`, `chmod +x`, `nohup`, `xattr -c`/`-d`, `display dialog`, plain `curl`; or any strong pattern in a script covered by a valid developer signature |
+| Data stealer traces | Strings from 3 or more of 8 families: keychain, browser data, wallets, password prompts, exfiltration, Notes, C2, VM checks | 2 families. Developer-signed and intact programs are only noted |
+| Hidden commands | Unsigned or ad hoc program importing `system`, `popen`, `exec*` or `posix_spawn*` with fewer than 25 readable strings | |
+| Launch after install | Unsigned package script that opens or loads something it placed in a hidden or temporary folder | |
+| VirusTotal | 5 or more engines flag the file (with an API key) | |
+
+When every red flag comes from loose scripts next to a single app, the verdict becomes **DO NOT RUN THE SCRIPT** and shows how to install the app without it. The exit code is `1` when there is a red flag, `0` otherwise.
+
+The stealer families and their patterns are defined near the top of the script in `STEAL_RX`. Measured against 63 installed apps on a working Mac, no legitimate app reached a red flag; two developer-signed tools (a remote desktop client and a security scanner) are only noted.
+
+## VirusTotal
+
+Without a key, every fingerprint is listed with a link. With a free key, detections and the suggested threat label are shown in the table.
+
+```sh
+mkdir -p ~/.config/check-dmg && (umask 077 && pbpaste > ~/.config/check-dmg/vt-api-key)
 ```
-check-dmg [--no-vt] <file.dmg | .iso | .pkg | .zip | .aar | App.app>
-```
 
-Colors are used when the output is a terminal (`NO_COLOR=1` turns them off). In terminals that support clickable links (iTerm2, WezTerm, VS Code, Ghostty), VirusTotal links are clickable; elsewhere the full URLs are printed.
+Or export `VT_API_KEY`. Only SHA-256 fingerprints are sent, to `https://www.virustotal.com/api/v3/files/<sha256>`. The free tier allows 4 lookups per minute: the tool waits 60 seconds between batches of four.
+
+## Options and environment
+
+| | |
+|---|---|
+| `--no-vt` | Skip VirusTotal lookups |
+| `VT_API_KEY` | VirusTotal API key (otherwise `~/.config/check-dmg/vt-api-key`) |
+| `NO_COLOR=1` / `FORCE_COLOR=1` | Turn colors off, or on when the output is not a terminal |
+| `FORCE_LINKS=1` | Use clickable OSC 8 links even if the terminal is not detected (iTerm2, WezTerm, VS Code, Ghostty, Hyper and Tabby are) |
+| `CHECK_DMG_WIDTH` | Output width in columns (60 to 100) |
 
 ## Limits
 
-`check-dmg` spots the usual traps. **It cannot prove that a file is safe.**
+check-dmg spots the usual traps. **It cannot prove that a file is safe.**
 
-- Malware can be packed, encrypted or obfuscated so that none of its strings are visible.
-- A program can wait days before doing anything, or download its real payload later.
-- A package that runs a compiled program as root can do more than its file list says.
-- VirusTotal only knows files someone has already submitted. "Not found" means unknown, not clean.
-
-For anything that asks for your password, the safest habits remain: a drag-and-drop app never needs it; never paste a command from a web page into Terminal; unlock one app with `xattr -dr com.apple.quarantine /Applications/Name.app` instead of disabling Gatekeeper; and keep an outgoing firewall and a persistence monitor running (for example LuLu and BlockBlock from Objective-See).
+- Packed, encrypted or obfuscated malware may expose no readable strings at all; the hidden-commands rule catches the common case, not every case.
+- A program can wait before acting, or download its real payload later.
+- A package that runs a compiled program as root can do more than its payload list says.
+- Files copied without a quarantine flag (SFTP, some download tools) skip Gatekeeper entirely once installed.
+- VirusTotal only knows files someone submitted. "Not found" means unknown, not clean.
 
 ## Tests
 
-```bash
+```sh
 tests/run-tests.sh
 ```
 
-The bench builds harmless fake installers (clean apps, fix scripts, ClickFix-style command files, hidden and embedded stealers, malicious and plain packages, a dropper package that hides and launches an app with encrypted commands, nested images, AppleScript and shell-script apps, Terminal files, instructions that ask to disable Gatekeeper, risky entitlements, zip and Apple Archive containers) and checks 18 verdicts. The fake stealers are tiny programs that only contain typical strings; they do nothing. It needs the Xcode command line tools (`xcode-select --install`).
+The bench builds harmless fake installers and checks 18 verdicts: clean apps, fix scripts, ClickFix-style command files, hidden and embedded stealers, malicious and plain packages, a dropper package that hides and launches an app with encrypted commands, nested images, AppleScript and shell-script apps, Terminal files, instructions that ask to disable Gatekeeper, risky entitlements, and zip and Apple Archive containers. The fake stealers only contain typical strings; they do nothing. It needs the Xcode command line tools (`xcode-select --install`). Set `KEEP_FIXTURES=/some/dir` to keep the generated files.
+
+The screenshots in this README were made from those fixtures.
 
 ## Contributing
 
-Issues and pull requests are welcome, especially new traps seen in the wild (with a fingerprint) and false positives on legitimate software. Please add a case to the test bench with each change.
+Issues and pull requests are welcome, especially new traps seen in the wild (with a SHA-256) and false positives on legitimate software. Please add a case to the test bench with each change.
 
 ## License
 

@@ -10,8 +10,9 @@ setopt NO_NOMATCH
 HERE="${0:A:h}"
 CHECK="${1:-$HERE/../check-dmg}"
 CHECK="${CHECK:A}"
-T=$(mktemp -d "${TMPDIR:-/tmp}/check-dmg-tests.XXXXXX")
-trap 'rm -rf "$T"' EXIT
+# KEEP_FIXTURES=/some/dir keeps the fake installers there (for screenshots or debugging).
+if [[ -n "$KEEP_FIXTURES" ]]; then T="${KEEP_FIXTURES:A}"; mkdir -p "$T"
+else T=$(mktemp -d "${TMPDIR:-/tmp}/check-dmg-tests.XXXXXX"); trap 'rm -rf "$T"' EXIT; fi
 pass=0; fail=0; typeset -a failed
 
 # ---------------------------------------------------------------- builders
