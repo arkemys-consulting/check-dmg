@@ -1,0 +1,664 @@
+#!/bin/zsh
+# check-dmg: inspect a .dmg, .iso, .pkg, .zip, .aar or .app WITHOUT running anything inside it.
+# Usage: check-dmg <file>
+# Mounts disk images read-only, lists what they contain, checks code signatures, reads install
+# scripts and instructions, compares with the copy already installed, and lists every
+# fingerprint to look up on VirusTotal. Nothing is uploaded anywhere.
+
+setopt NO_NOMATCH
+emulate -L zsh
+[[ -z "$LANG" ]] && export LANG=en_US.UTF-8
+
+# ------------------------------------------------------------------ display
+if [[ ( -t 1 || -n "$FORCE_COLOR" ) && -z "$NO_COLOR" ]]; then
+  RED=$'\e[31m'; YEL=$'\e[33m'; GRN=$'\e[32m'; BLU=$'\e[34m'; CYA=$'\e[36m'; MAG=$'\e[35m'
+  DIM=$'\e[2m'; BLD=$'\e[1m'; ITA=$'\e[3m'; NC=$'\e[0m'
+  BG_RED=$'\e[41;97;1m'; BG_YEL=$'\e[43;30;1m'; BG_GRN=$'\e[42;30;1m'
+else
+  RED= YEL= GRN= BLU= CYA= MAG= DIM= BLD= ITA= NC= BG_RED= BG_YEL= BG_GRN=
+fi
+W=$(tput cols 2>/dev/null); [[ -z "$W" || "$W" -lt 60 ]] && W=80; (( W > 100 )) && W=100
+
+# Clickable links in terminals that support them (OSC 8); plain URLs elsewhere.
+case "$TERM_PROGRAM" in iTerm.app|WezTerm|vscode|ghostty|Hyper|Tabby) LINKS=1 ;; *) LINKS=0 ;; esac
+[[ -n "$FORCE_LINKS" ]] && LINKS=1
+link() { (( LINKS )) && print -rn -- $'\e]8;;'"$1"$'\e\\'"$2"$'\e]8;;\e\\' || print -rn -- "$2"; }
+
+typeset -a FLAGS WARNS LOOSE_NAMES APPS_SEEN VT_LABELS VT_HASHES
+LOOSE_FLAGS=0
+hline()   { local i; for (( i=0; i<$1; i++ )); do print -rn -- "─"; done; }
+rule()    { print -r -- "${DIM}$(hline $1)${NC}"; }
+section() { print -r -- ""; print -rn -- "${BLD}${CYA}$1${NC} "; rule $(( W - ${#1} - 1 )); }
+sub()     { print -r -- ""; print -r -- "  ${BLD}▸ $1${NC}${2:+  ${DIM}$2${NC}}"; }
+flag()    { FLAGS+=("$1"); print -r -- "    ${RED}${BLD}✖${NC} ${RED}$1${NC}"; }
+warn()    { WARNS+=("$1"); print -r -- "    ${YEL}▲${NC} $1"; }
+ok()      { print -r -- "    ${GRN}✔${NC} $1"; }
+info()    { print -r -- "    ${DIM}·${NC} ${DIM}$1${NC}"; }
+detail()  { local l; for l in ${(f)1}; do print -r -- "      ${DIM}│${NC} ${DIM}$l${NC}"; done; }
+kv()      { printf "    ${DIM}%-12s${NC} %s\n" "$1" "$2"; }
+padr()    { # pad to a display width (wide CJK characters count double)
+  local s="$1" n="$2" w; w=${(m)#s}; (( w > n )) && { s="$(trunc "$s" $(( n - 1 )))"; w=${(m)#s}; }
+  local pad=$(( n - w )); (( pad < 0 )) && pad=0
+  print -rn -- "$s${(l:pad:: :)}"; }
+trunc()   { local s="$1" n="$2"; (( ${#s} > n )) && print -rn -- "${s[1,$((n-1))]}…" || print -rn -- "$s"; }
+human()   { local b="$1"; if (( b >= 1073741824 )); then printf "%.1f GB" $(( b / 1073741824.0 ));
+            elif (( b >= 1048576 )); then printf "%.1f MB" $(( b / 1048576.0 ));
+            elif (( b >= 1024 )); then printf "%d KB" $(( b / 1024 )); else printf "%d B" "$b"; fi; }
+vt_add()  { # $1 label, $2 sha256 : register a fingerprint for the final VirusTotal table; number in $REPLY
+  local i; for (( i=1; i<=${#VT_HASHES}; i++ )); do [[ "${VT_HASHES[$i]}" == "$2" ]] && { REPLY=$i; return; }; done
+  VT_LABELS+=("$1"); VT_HASHES+=("$2"); REPLY=${#VT_HASHES}; }
+vtref()   { print -rn -- "${MAG}[VT $1]${NC}"; }
+
+USE_VT=1; target=""
+for a in "$@"; do
+  case "$a" in
+    --no-vt) USE_VT=0 ;;
+    -h|--help) target="" ; break ;;
+    *) target="$a" ;;
+  esac
+done
+if [[ -z "$target" || ! -e "$target" ]]; then
+  cat <<USAGE
+Usage: check-dmg [--no-vt] <file.dmg | .iso | .pkg | .zip | .aar | App.app>
+
+Inspects an installer without running anything inside it.
+VirusTotal detections are shown when an API key is set, either in the
+VT_API_KEY environment variable or in ~/.config/check-dmg/vt-api-key.
+Only fingerprints (SHA-256) are sent, never the files. --no-vt skips the lookups.
+USAGE
+  exit 2
+fi
+target="${target:A}"
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/check-dmg.XXXXXX")
+MOUNT=""
+typeset -a NESTED
+cleanup() {
+  local m; for m in ${(Oa)NESTED}; do hdiutil detach "$m" -quiet -force >/dev/null 2>&1; done
+  [[ -n "$MOUNT" ]] && hdiutil detach "$MOUNT" -quiet -force >/dev/null 2>&1
+  rm -rf "$WORK"
+}
+trap cleanup EXIT INT TERM
+
+# Strong signals: a normal app installer has no reason to contain these.
+DANGER='spctl +--(master|global)-disable|csrutil|curl[^|]*\|[[:space:]]*(ba|z)?sh|wget[^|]*\|[[:space:]]*(ba|z)?sh|base64 +(-d|--decode|-D)|osascript|hidden answer|launchctl +(load|bootstrap)|LaunchAgents|LaunchDaemons|security +(find|dump)|login\.keychain|eval +"?\$\(|sudo '
+# Weak signals: common in harmless crack helpers (TNT's "Open Gatekeeper friendly" uses them).
+MINOR='display dialog|/tmp/[A-Za-z0-9_.$-]+|chmod +\+x|nohup|disown|xattr +-[a-z]*[cd]|curl |wget '
+
+# ------------------------------------------------------------------ checks
+scan_script() { # $1 = file, $2 = label, $3 = "trusted" when covered by a valid Developer ID signature
+  local f="$1" label="$2" hits minor
+  hits=$(grep -aEno "$DANGER" "$f" 2>/dev/null | head -8 | sed 's/^/line /')
+  minor=$(grep -aEno "$MINOR" "$f" 2>/dev/null | head -6 | sed 's/^/line /')
+  if [[ -n "$hits" && "$3" == "trusted" ]]; then
+    warn "$label (signed by the developer) touches system settings"; detail "$hits"
+  elif [[ -n "$hits" ]]; then
+    flag "$label contains risky commands"; detail "$hits"
+  elif [[ -n "$minor" ]]; then
+    warn "$label is a script with no risky command (temporary files or quarantine removal only)"; detail "$minor"
+  else
+    warn "$label is a script: read it before running it"
+  fi
+}
+
+# Families of traces left by macOS data stealers (AMOS, Banshee, Cuckoo, Poseidon...).
+# One family alone is common in normal apps; several together is a stealer's profile.
+typeset -A STEAL_RX
+STEAL_RX=(
+  keychain    'login\.keychain(-db)?|dump-keychain|find-generic-password|Chrome Safe Storage|Keychains/login'
+  browsers    'Login Data|cookies\.sqlite|logins\.json|key4\.db|Web Data|BraveSoftware|Firefox/Profiles|Opera Software|Microsoft Edge/|Vivaldi/'
+  wallets     'Exodus|Electrum|Ledger Live|MetaMask|nkbihfbeogaeaoehlefnkodbefgpgknn|Coinomi|atomic/Local Storage|Trezor|Phantom|bfnaelmomeimhlpmgjnjophhpkkoljpa|wallet\.dat'
+  password    'hidden answer|default answer ""|authonly|dscl \. -authonly|System Preferences needs|requires your password|Required Application Helper'
+  exfil       'api\.telegram\.org|/tmp/out\.zip|ditto -c -k|multipart/form-data|/sendDocument|discord(app)?\.com/api/webhooks'
+  notes       'NoteStore\.sqlite|group\.com\.apple\.notes|Library/Group Containers/group\.com\.apple\.notes'
+  c2          '\.onion|botid|bhost|socks5://|/gate\.php|/panel/'
+  vmcheck     'VMware|VirtualBox|QEMU|Parallels Virtual|SPHardwareDataType|SPMemoryDataType'
+)
+stealer_check() { # $1 = Mach-O file, $2 = label, $3 = "trusted" if developer-signed and intact
+  local f="$1" label="$2" fam hits found=() sz
+  sz=$(stat -f %z "$f" 2>/dev/null || echo 0)
+  (( sz > 157286400 )) && { info "$label: too large to scan for stealer traces"; return; }
+  for fam in keychain browsers wallets password exfil notes c2 vmcheck; do
+    hits=$(LC_ALL=C grep -aoE "${STEAL_RX[$fam]}" "$f" 2>/dev/null | sort -u | head -3 | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+    [[ -n "$hits" ]] && found+=("$fam ($hits)")
+  done
+  # A program that runs shell commands but contains almost no readable text hides what it runs.
+  if [[ "$3" != "trusted" ]]; then
+    local imports nread
+    imports=$(nm -u "$f" 2>/dev/null | grep -oE '^_(system|popen|execv|execve|execvp|posix_spawn|posix_spawnp)$' | sort -u | tr '\n' ' ')
+    if [[ -n "$imports" ]]; then
+      nread=$(strings -a -n 8 "$f" 2>/dev/null | grep -vE '^_|^__|NSt3__|^[A-Za-z0-9_]{1,3}$|basic_string|/usr/lib/|/System/Library/' | grep -E '[a-z]{4}' | sort -u | wc -l | tr -d ' ')
+      if (( nread < 25 )); then
+        flag "$label runs shell commands (${imports% }) but contains almost no readable text: it hides what it runs"
+      else
+        info "$label can run shell commands (${imports% })"
+      fi
+    fi
+  fi
+  (( ${#found} == 0 )) && return
+  if [[ "$3" == "trusted" ]]; then
+    (( ${#found} >= 3 )) && { info "$label touches ${#found} sensitive areas but is signed by its developer:"; detail "${(F)found}"; }
+  elif (( ${#found} >= 3 )); then
+    flag "$label looks like a DATA STEALER: traces from ${#found} families"; detail "${(F)found}"
+  elif (( ${#found} == 2 )); then
+    warn "$label touches sensitive data (2 families of stealer traces):"; detail "${(F)found}"
+  fi
+}
+
+check_app() { # $1 = path to .app
+  local app="$1" name="${1:t}" out auth team exe dev=0 trust="" ver
+  ver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null)
+  sub "$name" "${ver:+version $ver}"
+  APPS_SEEN+=("$name")
+  local bid0; bid0=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)
+  [[ "$bid0" == com.example.* || "$bid0" == com.yourcompany.* || -z "$bid0" ]] && warn "Placeholder or missing app identifier (${bid0:-none}): no real developer ships this"
+  out=$(codesign -dvv "$app" 2>&1)
+  auth=$(print -r -- "$out" | grep -m1 '^Authority=' | cut -d= -f2-)
+  team=$(print -r -- "$out" | grep -m1 '^TeamIdentifier=' | cut -d= -f2-)
+  if [[ "$auth" == "Developer ID Application:"* || "$auth" == "Apple Mac OS Application Signing" ]]; then
+    ok "Signed by ${auth#Developer ID Application: }"; dev=1
+  elif print -r -- "$out" | grep -q 'adhoc'; then
+    warn "Ad hoc signature: no developer certificate, cannot tell who built it"
+  elif [[ -n "$auth" ]]; then
+    warn "Signed by an unknown certificate ${BLD}\"$auth\"${NC} (team: ${team:-none})"
+  else
+    flag "Not signed at all"
+  fi
+  if print -r -- "$out" | grep -q 'not signed'; then
+    :
+  elif codesign --verify --deep --strict "$app" >/dev/null 2>&1; then
+    ok "Signature is intact"; (( dev )) && trust="trusted"
+  else
+    warn "Signature is broken, or the app was modified after signing"
+  fi
+  if spctl -a -t exec "$app" >/dev/null 2>&1; then
+    ok "Accepted by Gatekeeper (notarized by Apple)"
+  else
+    warn "Rejected by Gatekeeper (not notarized, or its ticket is not attached)"
+  fi
+  exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist" 2>/dev/null)
+  # An "app" that is really a script: AppleScript applet, Platypus wrapper, or a shell script as executable.
+  if [[ -n "$exe" && -f "$app/Contents/MacOS/$exe" ]]; then
+    local ek; ek=$(file -b "$app/Contents/MacOS/$exe" | head -1)
+    if [[ "$ek" == *script* || "$ek" == *text* ]]; then
+      warn "The app's program is a ${BLD}script${NC}, not a real app (a classic disguise):"
+      scan_script "$app/Contents/MacOS/$exe" "Contents/MacOS/$exe" "$trust"
+    fi
+  fi
+  if [[ -f "$app/Contents/Resources/Scripts/main.scpt" ]]; then
+    local src; src=$(osadecompile "$app/Contents/Resources/Scripts/main.scpt" 2>/dev/null)
+    warn "AppleScript app: its real code is a script (Contents/Resources/Scripts/main.scpt)"
+    if [[ -n "$src" ]]; then
+      print -r -- "$src" > "$WORK/main.applescript"; scan_script "$WORK/main.applescript" "main.scpt" "$trust"
+    else
+      warn "main.scpt is run-only (its source was removed): it cannot be inspected"
+    fi
+  fi
+  if [[ -f "$app/Contents/Resources/script" && -f "$app/Contents/Resources/AppSettings.plist" ]]; then
+    warn "Platypus app: it runs the script Contents/Resources/script"
+    scan_script "$app/Contents/Resources/script" "Contents/Resources/script" "$trust"
+  fi
+  # Entitlements that let foreign code in: cracks add them, malware likes them.
+  local ent; ent=$(codesign -d --entitlements - --xml "$app" 2>/dev/null | plutil -convert xml1 -o - - 2>/dev/null)
+  local e bad=()
+  for e in com.apple.security.cs.disable-library-validation com.apple.security.cs.allow-dyld-environment-variables com.apple.security.get-task-allow; do
+    print -r -- "$ent" | grep -A1 "<key>$e</key>" | grep -q '<true/>' && bad+=("${e#com.apple.security.}")
+  done
+  (( ${#bad} )) && { if (( dev )); then info "Entitlements that accept outside code: ${(j:, :)bad}";
+                     else warn "Allows outside code to be loaded into it: ${(j:, :)bad}"; fi; }
+  if [[ -n "$exe" && -f "$app/Contents/MacOS/$exe" ]]; then
+    stealer_check "$app/Contents/MacOS/$exe" "Main program" "$trust"
+    vt_add "$name program" "$(shasum -a 256 "$app/Contents/MacOS/$exe" | cut -c1-64)"
+    info "Main program $(vtref $REPLY)"
+    local inj l lf
+    inj=$(otool -L "$app/Contents/MacOS/$exe" 2>/dev/null | awk 'NR>1{print $1}' \
+          | grep -E '\.dylib$' | grep -vE '^/(System|usr/lib)/|libswift' | sort -u)
+    if [[ -n "$inj" ]]; then
+      warn "Extra code loaded at launch (this is how cracks inject themselves):"
+      for l in ${(f)inj}; do
+        lf=$(find "$app/Contents" -name "${l:t}" -type f 2>/dev/null | head -1)
+        if [[ -n "$lf" ]]; then
+          stealer_check "$lf" "${l:t}" ""
+          vt_add "${l:t}" "$(shasum -a 256 "$lf" | cut -c1-64)"
+          print -r -- "      ${DIM}│${NC} ${l:t} $(vtref $REPLY)"
+        else
+          detail "${l:t} (not found inside the app)"
+        fi
+      done
+    fi
+  fi
+  # Helpers the app will install to run as root.
+  local helpers h
+  helpers=$(find "$app/Contents/Library/LaunchServices" "$app/Contents/Library/LaunchDaemons" -maxdepth 1 \( -type f -o -name '*.app' \) 2>/dev/null)
+  if [[ -n "$helpers" ]]; then
+    if (( dev )); then
+      info "Ships a helper that runs as root, signed by the developer"
+    else
+      warn "Ships a helper that will run as ${BLD}ROOT${NC} at every startup, not signed by the developer:"
+    fi
+    for h in ${(f)helpers}; do
+      [[ -f "$h" ]] && stealer_check "$h" "${h:t}" "$( (( dev )) && print trusted)"
+      vt_add "${h:t} (root helper)" "$(shasum -a 256 "$h" | cut -c1-64)"
+      [[ -f "$h" ]] && print -r -- "      ${DIM}│${NC} ${h:t} $(vtref $REPLY)" \
+                    || detail "${h:t}"
+    done
+  fi
+  # Loose programs in Resources are unusual (nested helper apps are normal).
+  local odd
+  odd=$(find "$app/Contents/Resources" -type f -perm -u+x 2>/dev/null | grep -v '\.app/' \
+        | while read -r f; do file -b "$f" | head -1 | grep -q 'Mach-O' && print -r -- "${f#$app/}"; done | head -6)
+  [[ -n "$odd" ]] && { warn "Loose programs inside Resources (check what they are):"; detail "$odd"; }
+  typeset -A seen
+  local s sum
+  find "$app/Contents" -type f \( -name '*.sh' -o -name '*.command' -o -name '*.py' -o -name '*.scpt' \) 2>/dev/null \
+    | head -30 | while read -r s; do
+        grep -aqE "$DANGER" "$s" 2>/dev/null || continue
+        sum=$(shasum "$s" | cut -c1-40); [[ -n "${seen[$sum]}" ]] && continue; seen[$sum]=1
+        scan_script "$s" "${s#$app/}" "$trust"
+      done
+  compare_installed "$app" "$exe" "$auth"
+}
+
+compare_installed() { # $1 = app being checked, $2 = executable name, $3 = its signer
+  local app="$1" exe="$2" auth="$3" bid inst v1 v2 a2 same=1 thinned=0 f
+  bid=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)
+  [[ -z "$bid" ]] && return
+  inst=$(mdfind "kMDItemCFBundleIdentifier == '$bid'" -onlyin /Applications 2>/dev/null | grep '\.app$' | grep -v "^$app" | head -1)
+  [[ -z "$inst" && -d "/Applications/${app:t}" && "/Applications/${app:t}" != "$app" ]] && inst="/Applications/${app:t}"
+  print -r -- ""
+  print -r -- "    ${BLD}Compared with this Mac${NC}"
+  [[ -z "$inst" ]] && { info "Not installed yet on this Mac"; return; }
+  v1=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null)
+  v2=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$inst/Contents/Info.plist" 2>/dev/null)
+  a2=$(codesign -dvv "$inst" 2>&1 | grep -m1 '^Authority=' | cut -d= -f2-)
+  printf "    ${DIM}%-12s %-10s %s${NC}\n" "" "Version" "Signed by"
+  printf "    %-12s %-10s %s\n" "This file" "${v1:-?}" "$(trunc "${${auth#Developer ID Application: }:-ad hoc or none}" $(( W - 30 )))"
+  printf "    %-12s %-10s %s\n" "Installed" "${v2:-?}" "$(trunc "${${a2#Developer ID Application: }:-ad hoc or none}" $(( W - 30 )))"
+  for f in "Contents/MacOS/$exe" $(find "$app/Contents" -name '*.dylib' -type f -maxdepth 3 2>/dev/null | sed "s#^$app/##"); do
+    [[ -f "$inst/$f" ]] || { same=0; continue; }
+    [[ "$(shasum -a 256 "$app/$f" | cut -c1-64)" == "$(shasum -a 256 "$inst/$f" | cut -c1-64)" ]] && continue
+    # Cleaner apps strip the Intel code from installed apps: compare the Apple Silicon code only.
+    if lipo -archs "$app/$f" 2>/dev/null | grep -q arm64 && lipo -archs "$inst/$f" 2>/dev/null | grep -q arm64; then
+      local s1="$WORK/s1" s2="$WORK/s2"
+      lipo "$app/$f" -thin arm64 -output "$s1" 2>/dev/null || cp "$app/$f" "$s1"
+      lipo "$inst/$f" -thin arm64 -output "$s2" 2>/dev/null || cp "$inst/$f" "$s2"
+      [[ "$(shasum -a 256 "$s1" | cut -c1-64)" == "$(shasum -a 256 "$s2" | cut -c1-64)" ]] && { thinned=1; rm -f "$s1" "$s2"; continue; }
+      rm -f "$s1" "$s2"
+    fi
+    same=0
+  done
+  (( thinned )) && info "Your copy was slimmed (Intel code removed, probably by a cleaner app): compared on Apple Silicon code"
+  if (( same )) && [[ "$v1" == "$v2" ]]; then
+    ok "Same program and same crack as your copy: nothing new to install"
+  elif [[ "$v1" == "$v2" && "$a2" == "Developer ID Application:"* ]] && codesign --verify --deep --strict "$inst" >/dev/null 2>&1; then
+    warn "Your copy is the developer's ${BLD}original${NC}, unmodified. This file is a cracked rebuild: keep yours, it is safer"
+  elif [[ "$v1" == "$v2" && "$auth" != "$a2" ]]; then
+    warn "Same version, different crack"
+  elif [[ "$v1" != "$v2" ]]; then
+    info "Different version"
+  else
+    warn "Same version and signer, but the program differs from your copy: a modified repack?"
+  fi
+}
+
+check_pkg() { # $1 = path to .pkg
+  local pkg="$1" sig ptrust=""
+  sub "${pkg:t}" "installer package, $(human $(stat -f %z "$pkg"))"
+  sig=$(pkgutil --check-signature "$pkg" 2>&1)
+  if print -r -- "$sig" | grep -q 'signed by a developer certificate issued by Apple'; then
+    ptrust="trusted"
+    ok "Package signed by $(print -r -- "$sig" | grep -m1 '1\. ' | sed 's/^ *1\. //; s/^Developer ID Installer: //')"
+  elif print -r -- "$sig" | grep -q 'no signature'; then
+    warn "Package not signed (common for repacked releases: judge it on what it runs and where it writes)"
+  else
+    warn "Unusual package signature: $(print -r -- "$sig" | sed -n 2p)"
+  fi
+  info "A package runs its install programs as ${BLD}root${NC}${DIM} as soon as you type your password"
+  # Extract only the Scripts archives, never the multi-GB payload.
+  local ex="$WORK/pkg-${RANDOM}" entry sd got=0
+  mkdir -p "$ex"
+  for entry in ${(f)"$(xar -tf "$pkg" 2>/dev/null | grep -E '(^|/)Scripts$')"}; do
+    sd="$ex/${entry:h}/scripts.d"; mkdir -p "$sd"
+    xar -xf "$pkg" -C "$ex" "$entry" 2>/dev/null && (cd "$sd" && gunzip -c "$ex/$entry" 2>/dev/null | cpio -id --quiet 2>/dev/null) && got=1
+  done
+  if (( ! got )); then
+    if xar -tf "$pkg" >/dev/null 2>&1; then
+      got=1                                                       # flat package without any Scripts
+    else
+      pkgutil --expand "$pkg" "$ex/full" >/dev/null 2>&1 && got=1   # old bundle-style package
+    fi
+  fi
+  local f k a hsum doms rel nscript=0 nbin=0 ndata=0
+  typeset -A signed_by seen_bin
+  print -r -- ""
+  print -r -- "    ${BLD}What runs during installation${NC}"
+  if (( got )); then
+    for f in ${(f)"$(find "$ex" -type f ! -name '._*' ! -name 'Scripts' 2>/dev/null)"}; do
+      [[ "$f" == */Payload || "$f" == */Bom || "$f" == */PackageInfo || "$f" == */Distribution ]] && continue
+      k=$(file -b "$f" | head -1)
+      rel="${f#$ex/}"; rel="${rel//scripts.d\//}"
+      if [[ "$k" == *Mach-O* ]]; then
+        (( nbin++ ))
+        a=$(codesign -dvv "$f" 2>&1 | grep -m1 '^Authority=' | cut -d= -f2-)
+        if [[ "$a" == "Developer ID Application:"* ]]; then
+          signed_by[${a#Developer ID Application: }]=$(( ${signed_by[${a#Developer ID Application: }]:-0} + 1 ))
+        else
+          hsum=$(shasum -a 256 "$f" | cut -c1-64)
+          [[ -n "${seen_bin[$hsum]}" ]] && { info "Same program again: ${rel}"; continue; }
+          seen_bin[$hsum]=1
+          doms=$(LC_ALL=C grep -aoE 'https?://[A-Za-z0-9.-]+' "$f" 2>/dev/null | sed -E 's#https?://##' | sort -u | head -5 | tr '\n' ' ')
+          vt_add "${rel:t} (runs as root)" "$hsum"
+          warn "${BLD}${rel}${NC}: compiled program, ${a:-ad hoc or unsigned}, runs as root and cannot be read $(vtref $REPLY)"
+          stealer_check "$f" "${rel:t}" ""
+          [[ -n "$doms" ]] && detail "web addresses inside: ${doms}"
+        fi
+      elif [[ "$k" == *script* || "$k" == *"text executable"* ]] || head -c 2 "$f" 2>/dev/null | grep -q '#!'; then
+        (( nscript++ )); scan_script "$f" "${rel}" "$ptrust"
+        if [[ -z "$ptrust" ]] && grep -aqE '(^|[;&|[:space:]])(/usr/bin/)?open( -[a-zA-Z]+)* |launchctl |nohup ' "$f" \
+           && grep -aqE '/Library/Application Support/|/tmp/|/private/tmp/|/Users/Shared/|/\.[A-Za-z]' "$f"; then
+          flag "${rel} launches a program it placed in a hidden or temporary folder, right after installing it"
+          detail "$(grep -anE '(open|launchctl|nohup)|(Application Support|/tmp/|/Users/Shared/)' "$f" | cut -c1-$(( W - 14 )) | head -6)"
+        fi
+      else
+        (( ndata++ ))
+      fi
+    done
+    local who
+    for who in ${(k)signed_by}; do ok "${signed_by[$who]} program(s) signed by $who"; done
+    (( nscript + nbin == 0 )) && ok "No install scripts or programs"
+    (( ndata )) && info "${ndata} data file(s) beside them (archives, settings), not run directly"
+  else
+    warn "Could not read the package scripts"
+  fi
+  # Where the package writes once you type your password.
+  local files dests risky total
+  files=$(pkgutil --payload-files "$pkg" 2>/dev/null | sed 's#^\./#/#' | grep -v '^\.$' | grep -v '/\._')
+  if [[ -n "$files" ]]; then
+    total=$(print -r -- "$files" | wc -l | tr -d ' ')
+    print -r -- ""
+    print -r -- "    ${BLD}Where it writes${NC}  ${DIM}${total} items${NC}"
+    dests=$(print -r -- "$files" | awk -F/ 'NF>2{print "/"$2"/"$3}' | sort | uniq -c | sort -rn | head -8)
+    print -r -- "$dests" | while read -r cnt d; do printf "      ${DIM}%7s${NC}  %s\n" "$cnt" "$d"; done
+    risky=$( { print -r -- "$files" | grep -E '/Library/(LaunchDaemons|LaunchAgents|PrivilegedHelperTools|StartupItems)/|^/(private/)?(tmp|var)/|^/Users/|^/usr/local/bin/|^/etc/'; print -r -- "$files" | grep -v '\.app/' | grep -E '/\.[^/]+$'; } | head -8)
+    # Apps installed outside /Applications and packages inside the package: extract only those and check them.
+    local hidden_apps inner_pkgs targets=() t pe pdir
+    hidden_apps=$(print -r -- "$files" | grep -E '\.app$' | grep -vE '\.app/.*\.app$' | grep -v '^/Applications/' | head -5)
+    inner_pkgs=$(print -r -- "$files" | grep -E '\.(pkg|mpkg|dmg)$' | grep -v '\.app/' | head -3)
+    if [[ -n "$risky" ]]; then
+      warn "Items that start automatically or sit in unusual places (normal for drivers and helpers, odd for a plugin or an app):"
+      detail "$risky"
+    elif [[ -z "$hidden_apps$inner_pkgs" ]]; then
+      ok "Nothing set to start automatically, nothing in unusual places"
+    fi
+    [[ -n "$hidden_apps" ]] && warn "Installs app(s) OUTSIDE Applications, where you would never look:" && detail "$hidden_apps"
+    [[ -n "$inner_pkgs" ]] && warn "Contains another installer, to be opened after this one:" && detail "$inner_pkgs"
+    for t in ${(f)hidden_apps} ${(f)inner_pkgs}; do targets+=(".${t}" ".${t}/*"); done
+    if (( ${#targets} )) && (( ${PKG_DEPTH:-0} < 2 )); then
+      pdir="$WORK/payload-${RANDOM}"; mkdir -p "$pdir"
+      for pe in ${(f)"$(xar -tf "$pkg" 2>/dev/null | grep -E '(^|/)Payload$')"}; do
+        xar -xf "$pkg" -C "$pdir" "$pe" 2>/dev/null || continue
+        if file -b "$pdir/$pe" | grep -q gzip; then
+          (cd "$pdir" && gunzip -c "$pe" 2>/dev/null | cpio -id --quiet "${targets[@]}" 2>/dev/null)
+        elif head -c 4 "$pdir/$pe" | grep -q pbzx; then
+          info "Payload uses pbzx compression: hidden items listed but not opened"
+        fi
+        rm -f "$pdir/$pe"
+      done
+      for t in ${(f)hidden_apps}; do [[ -d "$pdir$t" ]] && check_app "$pdir$t"; done
+      for t in ${(f)inner_pkgs}; do
+        if [[ -f "$pdir$t" ]]; then
+          PKG_DEPTH=$(( ${PKG_DEPTH:-0} + 1 ))
+          case "${t:l}" in *.dmg) sub "${t:t}" "disk image inside the package";; *) check_pkg "$pdir$t" ;; esac
+          PKG_DEPTH=$(( PKG_DEPTH - 1 ))
+        fi
+      done
+    fi
+  fi
+}
+
+check_instructions() { # $1 = readme or instructions: what does it ask you to do?
+  local f="$1" n="${1:t}" text lines
+  case "${f:l}" in
+    *.html|*.htm) text=$(perl -0777 -pe 's/<(style|script)\b.*?<\/\1>//gis; s/<img[^>]*>//gi; s/<br[^>]*>|<\/(p|div|li|pre|code|h[1-6])>/\n/gi; s/<[^>]+>//g; s/&nbsp;/ /g; s/&quot;/"/g; s/&amp;/&/g; s/&lt;/</g; s/&gt;/>/g' "$f" 2>/dev/null) ;;
+    *.rtf) text=$(textutil -convert txt -stdout "$f" 2>/dev/null) ;;
+    *) text=$(LC_ALL=C tr -cd '[:print:]\n\t\200-\377' < "$f" 2>/dev/null) ;;
+  esac
+  lines=$(print -r -- "$text" | grep -aE 'sudo |xattr|spctl|csrutil|curl |chmod |codesign|SIP|Terminal|Терминал|终端|disable' | sed -E 's/^[[:space:]]+//' | cut -c1-$(( W - 12 )) | sort -u | head -8)
+  if [[ -z "$lines" ]]; then
+    info "\"$n\": no command to type"
+  elif print -r -- "$lines" | grep -qE 'spctl +--(master|global)-disable|csrutil +disable|curl[^|]*\|[[:space:]]*(ba|z)?sh|SIP'; then
+    warn "\"$n\" asks you to weaken macOS security (Gatekeeper or SIP) or to run downloaded code. Skip that part:"
+    detail "$lines"
+  else
+    info "\"$n\" mentions these commands:"; detail "$lines"
+  fi
+}
+
+kind_of() { # short description of an item for the contents table
+  local i="$1" n="${1:t}" k
+  [[ -L "$i" ]] && { print -rn -- "link to $(readlink "$i")"; return; }
+  case "${n:l}" in
+    *.app) print -rn -- "App"; return ;; *.pkg|*.mpkg) print -rn -- "Installer package"; return ;;
+    *.dmg|*.iso) print -rn -- "Disk image"; return ;; *.webloc) print -rn -- "Web shortcut"; return ;;
+    *.html|*.htm|*.txt|*.rtf|*.nfo|*.md) print -rn -- "Text or instructions"; return ;;
+    *.terminal) print -rn -- "Terminal command file"; return ;; *.command|*.sh|*.tool) print -rn -- "Script"; return ;;
+    *.inetloc|*.fileloc) print -rn -- "Shortcut"; return ;;
+  esac
+  [[ -d "$i" ]] && { print -rn -- "Folder"; return; }
+  k=$(file -b "$i" | head -1)
+  case "$k" in
+    *Mach-O*) print -rn -- "Program" ;; *script*|*"text executable"*) print -rn -- "Script" ;;
+    *JSON*) print -rn -- "JSON" ;; *text*) print -rn -- "Text" ;; *) print -rn -- "$(trunc "$k" 24)" ;;
+  esac
+}
+
+is_noise() { [[ "$1" == ".DS_Store" || "$1" == ".background" || "$1" == ".background."* || "$1" == ".VolumeIcon.icns" \
+  || "$1" == ".fseventsd" || "$1" == ".Trashes" || "$1" == ".DocumentRevisions-V100" || "$1" == ".TemporaryItems" ]]; }
+
+check_folder() { # $1 = folder (mounted image or extracted archive), $2 = depth
+  local root="$1" depth=${2:-0} found_app=0 item n kind url sz nw
+  typeset -A webs
+  # Contents table
+  nw=$(( W - 40 )); (( nw < 20 )) && nw=20
+  printf "    ${DIM}%-${nw}s  %-22s  %10s${NC}\n" "Item" "Kind" "Size"
+  for item in "$root"/*(N) "$root"/.*(N); do
+    n="${item:t}"; is_noise "$n" && continue
+    if [[ -d "$item" && ! -L "$item" && "$n" != *.app ]]; then sz="";
+    elif [[ "$n" == *.app ]]; then sz=$(human $(( $(du -sk "$item" 2>/dev/null | cut -f1) * 1024 )));
+    else sz=$(human $(stat -f %z "$item" 2>/dev/null || echo 0)); fi
+    local shown="$n" bare="${n//[[:space:] ]/}"
+    [[ "$bare" == .* && "$n" != .* ]] && shown="(blank name)${bare}"
+    [[ "$n" == .* ]] && shown="$shown (hidden)"
+    print -r -- "    $(padr "$shown" $nw)  $(padr "$(kind_of "$item")" 22)  ${(l:10:: :)sz}"
+  done
+  for item in "$root"/*(N) "$root"/.*(N); do
+    n="${item:t}"; is_noise "$n" && continue
+    if [[ -L "$item" ]]; then
+      [[ "$(readlink "$item")" == "/Applications" ]] && continue
+      warn "Shortcut \"$n\" points to $(readlink "$item")"; continue
+    fi
+    case "$n" in
+      *.app) found_app=1; check_app "$item" ;;
+      *.pkg|*.mpkg) found_app=1; check_pkg "$item" ;;
+      *.webloc)
+        url=$(plutil -extract URL raw "$item" 2>/dev/null)
+        [[ -z "$url" ]] && url=$(LC_ALL=C grep -aoE 'https?://[^<"]+' "$item" | grep -v 'apple.com/DTDs' | head -1)
+        url=$(print -r -- "$url" | sed -E 's#https?://([^/?]+).*#\1#'); webs[${url:-unknown}]=$(( ${webs[${url:-unknown}]:-0} + 1 )) ;;
+      *.html|*.htm|*.txt|*.rtf|*.nfo|*.md) check_instructions "$item" ;;
+      *.terminal)
+        local cmd="$(plutil -extract CommandString raw "$item" 2>/dev/null)"
+        if [[ -n "$cmd" ]]; then
+          print -r -- "$cmd" > "$WORK/term.sh"; local before=${#FLAGS}
+          warn "\"$n\" is a Terminal settings file that runs a command when opened:"; detail "$(print -r -- "$cmd" | cut -c1-$(( W - 12 )) | head -5)"
+          scan_script "$WORK/term.sh" "\"$n\""
+          (( ${#FLAGS} > before )) && { LOOSE_FLAGS=$(( LOOSE_FLAGS + ${#FLAGS} - before )); LOOSE_NAMES+=("$n"); }
+        else
+          info "\"$n\": Terminal settings file, no command inside"
+        fi ;;
+      *.inetloc|*.fileloc)
+        url=$(plutil -extract URL raw "$item" 2>/dev/null)
+        [[ "$url" == file://* ]] && warn "\"$n\" opens a local file: $url" || info "\"$n\" opens ${url:-nothing readable}" ;;
+      *.dmg|*.iso)
+        if (( depth < 2 )); then
+          local nm="$WORK/nested-${RANDOM}"; mkdir -p "$nm"
+          vt_add "$n" "$(shasum -a 256 "$item" | cut -c1-64)"
+          sub "$n" "disk image inside the disk image $(vtref $REPLY)"
+          if hdiutil attach "$item" -readonly -nobrowse -noautoopen -noverify -mountpoint "$nm" >/dev/null 2>&1; then
+            NESTED+=("$nm"); check_folder "$nm" $(( depth + 1 )); found_app=1
+          else
+            flag "Nested image \"$n\" could not be mounted"
+          fi
+        fi ;;
+      *)
+        if [[ -d "$item" ]]; then
+          if [[ "$n" == .* ]]; then
+            warn "Hidden folder \"$n\""
+          elif (( depth < 2 )); then
+            sub "$n/" "folder"; check_folder "$item" $(( depth + 1 )); found_app=1
+          fi
+        else
+          kind=$(file -b "$item" | head -1 | cut -c1-70)
+          if print -r -- "$kind" | grep -q 'Mach-O'; then
+            vt_add "$n" "$(shasum -a 256 "$item" | cut -c1-64)"
+            flag "Loose program \"$n\" outside any app $(vtref $REPLY)"
+            stealer_check "$item" "\"$n\"" ""
+          elif print -r -- "$kind" | grep -qiE 'script|text executable' || [[ -x "$item" ]]; then
+            local before=${#FLAGS}
+            scan_script "$item" "\"$n\""
+            (( ${#FLAGS} > before )) && { LOOSE_FLAGS=$(( LOOSE_FLAGS + ${#FLAGS} - before )); LOOSE_NAMES+=("$n"); }
+          elif [[ "$n" == .* && $(stat -f %z "$item") -lt 400 ]] && print -r -- "$kind" | grep -qiE 'text|JSON|ASCII|empty'; then
+            info "Hidden note \"$n\": $(tr '\n' ' ' < "$item" | cut -c1-$(( W - 30 )))"
+          elif [[ "$n" == .* ]]; then
+            warn "Hidden file \"$n\" ($kind)"
+          fi
+        fi ;;
+    esac
+  done
+  local d; for d in ${(k)webs}; do info "${webs[$d]} web shortcut(s) open ${d}"; done
+  (( found_app || depth > 0 )) || warn "No app or installer package at the top level"
+}
+
+# ------------------------------------------------------------------ main
+size=$( [[ -d "$target" ]] && human $(( $(du -sk "$target" | cut -f1) * 1024 )) || human $(stat -f %z "$target") )
+src=$(mdls -raw -name kMDItemWhereFroms "$target" 2>/dev/null | grep -oE 'https?://[^/" ]+' | sed -E 's#https?://##' | sort -u | tr '\n' ' ')
+q=$(xattr -p com.apple.quarantine "$target" 2>/dev/null)
+title="${target:t}"; inner=$(( W - 4 ))
+print -r -- "${BLU}╭$(hline $(( W - 2 )))╮${NC}"
+printf "${BLU}│${NC} ${BLD}%-${inner}s${NC} ${BLU}│${NC}\n" "check-dmg"
+printf "${BLU}│${NC} %-${inner}s ${BLU}│${NC}\n" "$(trunc "$title" $inner)"
+print -r -- "${BLU}╰$(hline $(( W - 2 )))╯${NC}"
+
+section "FILE"
+kv "Size" "$size"
+[[ -n "$src" ]] && kv "Source" "$src"
+if [[ -f "$target" ]]; then
+  hash=$(shasum -a 256 "$target" | awk '{print $1}')
+  vt_add "${target:t}" "$hash"
+  kv "SHA-256" "${hash[1,16]}…${hash[-8,-1]}  $(vtref $REPLY)"
+  [[ -n "$q" ]] && kv "Quarantine" "yes, Gatekeeper will check what you open" \
+                || kv "Quarantine" "${DIM}none (normal for files copied by SFTP or from a server): this tool is the only check${NC}"
+fi
+
+section "CONTENTS"
+case "${target:l}" in
+  *.dmg|*.iso|*.sparseimage)
+    existing=$(hdiutil info | awk -F'\t' -v t="$target" '/^image-path/{p=$0; sub(/^image-path *: /,"",p); m=(p==t)} m && /^\/dev\/disk/ && $NF ~ /^\// {print $NF}' | sed 's/ *$//' | grep -v 'check-dmg\.' | head -1)
+    if [[ -n "$existing" && -d "$existing" ]]; then
+      info "Already open in the Finder: checked there. Do not run anything from it yet"
+      check_folder "$existing"
+    else
+      MOUNT="$WORK/mnt"; mkdir -p "$MOUNT"
+      if err=$(hdiutil attach "$target" -readonly -nobrowse -noautoopen -noverify -mountpoint "$MOUNT" 2>&1 >/dev/null); then
+        info "Mounted read-only: nothing was opened or run"
+        check_folder "$MOUNT"
+      else
+        MOUNT=""
+        if print -r -- "$err" | grep -qi 'busy'; then
+          warn "The image is busy (open elsewhere). Eject it in the Finder and run this again"
+        else
+          flag "The disk image could not be mounted: $(print -r -- "$err" | grep -v WARNING | tail -1)"
+        fi
+      fi
+    fi ;;
+  *.pkg|*.mpkg) check_pkg "$target" ;;
+  *.zip)
+    ditto -x -k "$target" "$WORK/zip" 2>/dev/null && { info "Extracted to a temporary folder"; check_folder "$WORK/zip"; } || flag "Could not extract the archive" ;;
+  *.aar|*.aea)
+    mkdir -p "$WORK/aar"
+    aa extract -i "$target" -d "$WORK/aar" 2>/dev/null && { info "Apple Archive extracted to a temporary folder"; check_folder "$WORK/aar"; } || flag "Could not extract the archive" ;;
+  *.app) check_app "$target" ;;
+  *) warn "Unknown file type: $(file -b "$target")" ;;
+esac
+
+# VirusTotal table: nothing is uploaded, these are lookups by fingerprint.
+if (( ${#VT_HASHES} )); then
+  section "VIRUSTOTAL"
+  info "Lookups by fingerprint only, nothing is uploaded. Many detections = malware, \"not found\" = never scanned"
+  print -r -- ""
+  local_w=$(( W - 34 )); (( local_w < 20 )) && local_w=20
+  VTKEY="${VT_API_KEY:-$(cat ~/.config/check-dmg/vt-api-key 2>/dev/null)}"
+  (( USE_VT )) || VTKEY=""
+  typeset -A VT_RES
+  if [[ -n "$VTKEY" ]]; then
+    # Free API: 4 lookups per minute. Wait between batches rather than fail.
+    for (( i=1; i<=${#VT_HASHES}; i++ )); do
+      (( i > 1 && (i - 1) % 4 == 0 )) && { print -rn -- "    ${DIM}waiting 60 s for the VirusTotal rate limit…${NC}\r"; sleep 61; print -rn -- "\e[2K"; }
+      h="${VT_HASHES[$i]}"; jf="$WORK/vt-$i.json"
+      code=$(curl -s -o "$jf" -w '%{http_code}' -H "x-apikey: $VTKEY" "https://www.virustotal.com/api/v3/files/$h" 2>/dev/null)
+      if [[ "$code" == 200 ]]; then
+        mal=$(plutil -extract data.attributes.last_analysis_stats.malicious raw "$jf" 2>/dev/null)
+        sus=$(plutil -extract data.attributes.last_analysis_stats.suspicious raw "$jf" 2>/dev/null)
+        tot=$(( mal + sus + $(plutil -extract data.attributes.last_analysis_stats.undetected raw "$jf" 2>/dev/null || echo 0) + $(plutil -extract data.attributes.last_analysis_stats.harmless raw "$jf" 2>/dev/null || echo 0) ))
+        lab=$(plutil -extract data.attributes.popular_threat_classification.suggested_threat_label raw "$jf" 2>/dev/null)
+        VT_RES[$i]="$(( mal + sus ))/$tot${lab:+ $lab}"
+        (( mal + sus >= 5 )) && flag "VirusTotal: ${VT_LABELS[$i]} is detected by $(( mal + sus )) engines${lab:+ ($lab)}"
+      elif [[ "$code" == 404 ]]; then VT_RES[$i]="not found"
+      elif [[ "$code" == 401 ]]; then VT_RES[$i]="bad API key"
+      elif [[ "$code" == 429 ]]; then VT_RES[$i]="rate limited"
+      else VT_RES[$i]="no answer"; fi
+    done
+  else
+    info "Add a free VirusTotal API key to see detections here (see check-dmg --help)"
+  fi
+  print -r -- ""
+  printf "    ${DIM}%-4s %-$(( local_w - 12 ))s %-20s %-12s %s${NC}\n" "#" "Item" "SHA-256" "Detections" "Link"
+  for (( i=1; i<=${#VT_HASHES}; i++ )); do
+    h="${VT_HASHES[$i]}"
+    res="${VT_RES[$i]:-?}"; rc="$DIM"
+    [[ "$res" == 0/* ]] && rc="$GRN"; [[ "$res" =~ '^[1-4]/' ]] && rc="$YEL"; [[ "$res" =~ '^([5-9]|[1-9][0-9]+)/' ]] && rc="$RED"
+    printf "    ${MAG}%-4s${NC} %-$(( local_w - 12 ))s ${DIM}%-20s${NC} ${rc}%-12s${NC} " "$i" "$(trunc "${VT_LABELS[$i]}" $(( local_w - 12 )))" "${h[1,8]}…${h[-6,-1]}" "$(trunc "${res%% *}" 12)"
+    if (( LINKS )); then link "https://www.virustotal.com/gui/file/$h" "${BLU}open ↗${NC}"; print; else print -r -- "${DIM}below${NC}"; fi
+  done
+  for (( i=1; i<=${#VT_HASHES}; i++ )); do
+    [[ "${VT_RES[$i]}" == *" "* && "${VT_RES[$i]}" != "not found" && "${VT_RES[$i]}" != "bad API key" && "${VT_RES[$i]}" != "rate limited" && "${VT_RES[$i]}" != "no answer" ]] && \
+      print -r -- "    ${MAG}$i${NC}  ${DIM}label: ${VT_RES[$i]#* }${NC}"
+  done
+  if (( ! LINKS )); then
+    print -r -- ""
+    for (( i=1; i<=${#VT_HASHES}; i++ )); do print -r -- "    ${MAG}$i${NC}  https://www.virustotal.com/gui/file/${VT_HASHES[$i]}"; done
+  fi
+fi
+
+section "VERDICT"
+print -r -- ""
+if (( ${#FLAGS} )) && (( LOOSE_FLAGS == ${#FLAGS} )) && (( ${#APPS_SEEN} == 1 )); then
+  print -r -- "    ${BG_RED} DO NOT RUN THE SCRIPT ${NC}  ${BLD}${(j:", ":)LOOSE_NAMES}${NC}"
+  print -r -- ""
+  print -r -- "    The app itself shows no red flag. To install it without the script:"
+  print -r -- "      1. Drag ${BLD}${APPS_SEEN[1]}${NC} to Applications"
+  print -r -- "      2. Unlock that app only:  ${CYA}xattr -dr com.apple.quarantine \"/Applications/${APPS_SEEN[1]}\"${NC}"
+  print -r -- "    ${DIM}No password is needed. ${#WARNS} warning(s) above.${NC}"
+elif (( ${#FLAGS} )); then
+  print -r -- "    ${BG_RED} DO NOT RUN ${NC}  ${RED}${#FLAGS} red flag(s)${NC}, ${#WARNS} warning(s)"
+  print -r -- "    Never type your password for this installer."
+elif (( ${#WARNS} )); then
+  print -r -- "    ${BG_YEL} CAUTION ${NC}  ${#WARNS} warning(s), no red flag"
+  print -r -- "    Check the VirusTotal links before opening anything."
+else
+  print -r -- "    ${BG_GRN} LOOKS CLEAN ${NC}  no warning"
+  print -r -- "    Still check the VirusTotal links."
+fi
+print -r -- ""
+print -r -- "    ${DIM}${ITA}This tool cannot prove a file is safe: it only spots the usual traps.${NC}"
+print -r -- ""
+(( ${#FLAGS} )) && exit 1 || exit 0
